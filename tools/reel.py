@@ -13,6 +13,10 @@ Text comes from the record's "en" block (hook, text, ref, kratce, uvaha, otazka)
 """
 import argparse, json, os, re, subprocess, sys
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import hashlib
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bg as scenes
 
 W, H, FPS = 1080, 1920, 30
 BG_TOP, BG_BOT = (16, 18, 24), (6, 7, 10)
@@ -95,6 +99,28 @@ def text_layer(size, items):
     return layer
 
 
+def seed_for(rec):
+    return int(hashlib.md5((rec.get('datum', '') + rec.get('ref', '')).encode()).hexdigest()[:8], 16)
+
+
+class Finisher:
+    """vignette + centre darkening + film grain, precomputed for speed"""
+    def __init__(self, w, h, seed, darken=0.42, center=0.36):
+        yy = np.linspace(-1, 1, h)[:, None]; xx = np.linspace(-1, 1, w)[None, :]
+        vig = np.clip(1 - 0.38 * (xx ** 2 + yy ** 2), 0.45, 1)
+        band = 1 - darken * np.exp(-((yy - (center * 2 - 1)) / 0.6) ** 2)
+        bottom = 1 - 0.45 * np.clip((yy - 0.6) / 0.4, 0, 1)   # darker footer for brand/CTA
+        self.mul = (vig * band * bottom)[..., None].astype(np.float32)
+        r = np.random.default_rng(seed)
+        self.grain = [r.normal(0, 6, (h, w, 1)).astype(np.float32) for _ in range(4)]
+        self.i = 0
+
+    def __call__(self, img):
+        arr = np.asarray(img.convert('RGB'), np.float32) * self.mul + self.grain[self.i % 4]
+        self.i += 1
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
+
 def brand(d, znacka, w, h, color=GREY, size=34, y_off=90):
     d.text((w / 2, h - y_off), '@' + znacka, font=font(F_SANS_B, size), fill=color, anchor='ms')
 
@@ -106,13 +132,15 @@ def render_reel(rec, znacka, out_mp4):
     ref = en['ref'] + ' (KJV)'
     kratce = en.get('kratce', '')
     otazka = en.get('otazka', '')
-    bg = gradient(W, H)
-    probe = ImageDraw.Draw(bg)
+    sd = seed_for(rec)
+    layers, pal, kind = scenes.scene_layers(rec.get('tema', '') + ' ' + en.get('hook', ''), W, H, sd)
+    fin = Finisher(W, H, sd)
+    probe = ImageDraw.Draw(Image.new('RGB', (10, 10)))
     MW = W - 2 * 110
     # scene 1 – hook
     fh, hook_lines = fit(probe, hook, F_SERIF_B, 92, MW, 5)
     lh1 = int(fh.size * 1.25)
-    y1 = H * 0.42 - lh1 * len(hook_lines) / 2
+    y1 = H * 0.34 - lh1 * len(hook_lines) / 2
     hook_words = []  # (word, x_center_of_line, line_index)
     for i, ln in enumerate(hook_lines):
         hook_words.append((ln.split(), i))
@@ -122,7 +150,7 @@ def render_reel(rec, znacka, out_mp4):
     lh2 = int(fv.size * 1.42)
     fref = font(F_SANS_B, 40)
     block_h = lh2 * len(vlines) + 90
-    y2 = H * 0.47 - block_h / 2
+    y2 = H * 0.36 - block_h / 2
     # scene 3
     parts = re.split(r'(\*[^*]+\*)', kratce)
     fk, klines = fit(probe, strip_stars(kratce), F_SERIF_B, 78, MW, 4)
@@ -139,12 +167,7 @@ def render_reel(rec, znacka, out_mp4):
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     for k in range(n):
         t = k / FPS
-        frame = bg.copy()
-        # slow zoom of the background
-        z = 1 + 0.04 * (t / T3)
-        if z > 1.001:
-            bw, bh = int(W * z), int(H * z)
-            frame = frame.resize((bw, bh)).crop(((bw - W) // 2, (bh - H) // 2, (bw - W) // 2 + W, (bh - H) // 2 + H))
+        frame = fin(scenes.compose(layers, W, H, t / T3, shift=110, zoom=0.05))
         items = []
         if t < T1 + 0.3:
             fade_out = 1 - ease((t - T1 + 0.1) / 0.4) if t > T1 - 0.1 else 1
@@ -169,7 +192,7 @@ def render_reel(rec, znacka, out_mp4):
             items.append(('— ' + ref, fref, GOLD, (W / 2, y2 + lh2 * len(vlines) + 40), ease((t - start) / 0.45) * fade_out, 'ma'))
         if t > T2 - 0.1:
             a = ease((t - T2) / 0.45)
-            yk = H * 0.33
+            yk = H * 0.22
             for i, ln in enumerate(klines):
                 # gold for the *star* word, white otherwise
                 lw = probe.textlength(ln, font=fk)
@@ -183,10 +206,10 @@ def render_reel(rec, znacka, out_mp4):
             for i, ln in enumerate(qlines):
                 items.append((ln, fq, GREY, (W / 2, yq + i * fq.size * 1.35), a2, 'ma'))
             a3 = ease((t - T2 - 1.2) / 0.45)
-            items.append(('Follow for a verse every day', fcta, GOLD, (W / 2, H * 0.80), a3, 'ma'))
+            items.append(('Follow for a verse every day', fcta, GOLD, (W / 2, H * 0.86), a3, 'ma'))
         frame = Image.alpha_composite(frame.convert('RGBA'), text_layer((W, H), items)).convert('RGB')
         d = ImageDraw.Draw(frame)
-        brand(d, znacka, W, H, y_off=150)
+        brand(d, znacka, W, H, y_off=110)
         p.stdin.write(frame.tobytes())
     p.stdin.close()
     if p.wait() != 0:
@@ -197,21 +220,25 @@ def render_carousel(rec, znacka, outdir):
     en = rec['en']
     CW, CH = 1080, 1350
     MW = CW - 2 * 100
-    bg = gradient(CW, CH)
+    sd = seed_for(rec)
+    layers, *_ = scenes.scene_layers(rec.get('tema', '') + ' ' + en.get('hook', ''), CW, 1920, sd)
+    tall = scenes.compose(layers, CW, 1920, 0.5).crop((0, 200, CW, 200 + CH))
+    fin = Finisher(CW, CH, sd, darken=0.5, center=0.33)
+    bg = fin(tall)
     files = []
     # slide 1 – hook
     im = bg.copy(); d = ImageDraw.Draw(im)
     f, lines = fit(d, strip_stars(en['hook']), F_SERIF_B, 96, MW, 5)
-    y = CH * 0.44 - len(lines) * f.size * 1.25 / 2
+    y = CH * 0.32 - len(lines) * f.size * 1.25 / 2
     for i, ln in enumerate(lines):
         d.text((CW / 2, y + i * f.size * 1.25), ln, font=f, fill=WHITE, anchor='ma')
-    d.text((CW / 2, CH - 190), 'swipe →', font=font(F_SANS_B, 40), fill=GOLD, anchor='ms')
+    d.text((CW / 2, CH - 160), 'swipe →', font=font(F_SANS_B, 40), fill=GOLD, anchor='ms')
     brand(d, znacka, CW, CH); files.append(im)
     # slide 2 – verse
     im = bg.copy(); d = ImageDraw.Draw(im)
     f, lines = fit(d, '“' + en['text'].strip().strip('“”"') + '”', F_SERIF, 64, MW, 12)
     lh = f.size * 1.42
-    y = CH * 0.46 - (len(lines) * lh + 90) / 2
+    y = CH * 0.33 - (len(lines) * lh + 90) / 2
     for i, ln in enumerate(lines):
         d.text((CW / 2, y + i * lh), ln, font=f, fill=WHITE, anchor='ma')
     d.text((CW / 2, y + len(lines) * lh + 40), '— ' + en['ref'] + ' (KJV)', font=font(F_SANS_B, 40), fill=GOLD, anchor='ma')
@@ -219,14 +246,14 @@ def render_carousel(rec, znacka, outdir):
     # slide 3 – reflection + question + CTA
     im = bg.copy(); d = ImageDraw.Draw(im)
     f, lines = fit(d, en.get('uvaha', ''), F_SERIF, 52, MW, 9)
-    y = 230
+    y = 140
     for i, ln in enumerate(lines):
         d.text((CW / 2, y + i * f.size * 1.4), ln, font=f, fill=WHITE, anchor='ma')
     y += len(lines) * f.size * 1.4 + 70
     fq, ql = fit(d, en.get('otazka', ''), F_SANS_B, 46, MW, 4)
     for i, ln in enumerate(ql):
         d.text((CW / 2, y + i * fq.size * 1.35), ln, font=fq, fill=GOLD, anchor='ma')
-    d.text((CW / 2, CH - 190), 'Save it · Share it · Follow for daily verses', font=font(F_SANS, 34), fill=GREY, anchor='ms')
+    d.text((CW / 2, CH - 160), 'Save it · Share it · Follow for daily verses', font=font(F_SANS, 34), fill=GREY, anchor='ms')
     brand(d, znacka, CW, CH); files.append(im)
     out = []
     for i, im in enumerate(files, 1):
